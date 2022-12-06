@@ -1,0 +1,3 @@
+read.table("foo.txt")
+git remote add origin git@github.com:username/new_repo
+

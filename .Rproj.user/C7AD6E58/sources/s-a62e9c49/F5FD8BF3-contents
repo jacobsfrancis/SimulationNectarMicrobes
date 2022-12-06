@@ -1,0 +1,11 @@
+#to access google drive
+library(googledrive)
+
+t<-drive_get("~/SimulationNectarMicrobes/")
+
+Folder <- drive_ls(t)
+
+
+drive_download(Folder[Folder$name=="MySim.R",],overwrite=T)
+
+rm(list=ls())

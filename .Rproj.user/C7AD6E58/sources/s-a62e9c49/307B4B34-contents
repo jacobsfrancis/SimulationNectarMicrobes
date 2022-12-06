@@ -1,0 +1,440 @@
+# Agent based model of pollination and microbial dispersal
+
+# This model is designed to test how microbes which change the signal of a flower
+# and change its quality might shape bees decisions to visit flowers, and shape their 
+# own dispersal.  It also will eventually include parameters for floral defenses that 
+# change microbial growth and bee preference.
+
+# There are two types of agents:
+  # Bees - Params:
+        # 1) their decision threshold (i.e. signal above which they will visit a flower) 
+        # 2) the quantity of microbes they are carying
+        # 3) the quantity of pollen they are carying (for plant perspective questions)
+        # 4) their innate preferences for nectar sugars (and alkaloids for later)
+  # Flowers - Params:
+        # 1) Their species (for plant perspective questions later)
+        # 2) Their signal this is a linear measure of a signal (TODO think of multiple signal axes?)       
+        # 3) their microbial carrying capacity
+        # 4) Their nectar chemistry (sugars and alkaloids) 
+        # 5) Their pollen load (for plant perspective questions later)
+        # 6) Their pollen deposition rate (for plant perspective questions later)
+
+  # Microbes - Params:
+        
+        # 1) their growth rate - r in traditional logistic growth equations
+        # 2) their change to the signal, this is multiplied by the population number so it should be small
+        # 3) their change to the sugar, this is multiplied by the population number so it should be small
+        # 4) their change to the alkaloid, this is multiplied by the population number so it should be small
+
+# At each time step microbes grow using a logarithmic growth function, then
+# bees approach a flower (randomly) and decide whether to visit it
+# If they visit it they remove nectar and microbes, deposit microbes, 
+#   assess flower quality, and update their threshold.
+
+# Some requirements - there must always be more flowers than pollinators!
+
+
+#clear the work space (important for debugging code in production)
+
+rm(list=ls())
+
+library(ggplot2)
+library(reshape2)
+library(plyr)
+library(parallel)
+library(emmeans)
+
+#Critical functions ####
+
+# microbial growth function 
+grow <- function(microbe,flower){
+              # define some times
+              prev <- max(flower$time)
+              current <- prev + 1
+              prevFlow <- flower[flower$time==prev,]
+              
+              # flowers secrete nectar if they are below max and we calculate capacity
+              
+              newNec <- prevFlow$necVol
+              if(prevFlow$necVol < prevFlow$maxNectar){newNec <- prevFlow$necVol + prevFlow$refillRate}
+              if(newNec > prevFlow$maxNectar){newNec <- prevFlow$maxNectar}
+              K <- newNec * 500
+              
+              #first microbes grow using standard logistic growth 
+              r <- microbe$growthRate
+              P <- prevFlow$microbesP1 # REMEMBER TO CHANGE IF WE ADD MORE MICROBES!
+              P2 <- r*P*(1-(P/K))
+              newP <- P+P2
+              
+              
+              # then microbes change the signal of the plant
+              sig <- flower$signal[1]
+              newSig <- sig + microbe$signalDelt*newP
+              
+              #then microbes change the quality of the plant
+              sug <- flower$sugar[1]
+              alk <- flower$alkaloid[1]
+              newSug <- sug + microbe$sugarDelt* newP
+              newAlk <- alk + microbe$alkaloidDelt * newP
+              
+              
+              
+              flower[current,] <- data.frame(time=current, 
+                                       species=prevFlow$species,
+                                       signal = newSig,
+                                       microbesP1 = newP,
+                                       microbeK = newNec * 500,
+                                       necVol = newNec,
+                                       maxNectar = prevFlow$maxNectar,
+                                       refillRate = prevFlow$refillRate,
+                                       sugar=newSug,
+                                       alkaloid=newAlk,
+                                       pollenF1=prevFlow$pollenF1,
+                                       pollenDepRate = prevFlow$pollenDepRate,
+                                       visit= 0,
+                                       ID=prevFlow$ID)
+              
+              #then return the changed flower
+              return(flower)
+           }
+
+  
+# decision function 
+
+
+  decide <- function(bee, flower){
+              # bee senses a flower, decides whether to visit based on its threshold
+                # flowsp <- flower$species # may need this when we add more species
+                currentTime <- max(flower$time)
+              
+                
+                if(bee[bee$time==currentTime-1,"thresholdF1"] < flower[flower$time==currentTime, "signal"]){
+                  
+                  return (visit(bee,flower))
+ 
+                }
+                else{
+                  noChngBee <- bee[currentTime-1,]
+                  noChngBee$time <- noChngBee$time+1
+                  bee[currentTime,] <- noChngBee
+                  
+                  flower$visit[currentTime] <- 0
+                  bee$visit[currentTime] <- 0
+                  
+                 # no need to change flower because we already updated it...
+                  return(list(bee=bee,flower=flower))
+                           
+                            }
+  }
+  
+  # visit function 
+
+  visit <- function(bee,flower){
+    
+    #bee gets microbes, assess flower, updates threshold
+      
+      ## flowsp <- flower[["species"]]   # may need if we add more species of flowers
+      currentTime <-  max(flower$time)
+      prevBee <- bee[currentTime-1,]
+      prevFlow <- flower[currentTime,]
+      
+      newBee <- bee[currentTime-1,]
+      newBee$time <- newBee$time+1
+      newBee$visit <- 1
+      newFlow <- flower[currentTime,] # already have the correct row for the flower so we dont need to look back...
+      
+      #transfer microbes 
+      
+      newBee$microbe1 <-  .08 * prevBee$microbe1 + .2 * prevFlow$microbesP1 # amount bee will get, notice they eat about 92% of microbes so not all are avail for dispersal
+      newFlow$microbesP1 <- .2 * prevFlow$microbesP1 + .02 * prevBee$microbe1  # amount bee will deposit notice that these decrease by the amount transfered
+      newFlow$necVol <- .2 * prevFlow$necVol # pollinator takes 80% of the nectar
+      
+      #Bees assess flower and update threshold
+      # right now bees add a percent difference between their expectations and reality
+      # if the flower was better this number is negative and they lower their threshold,
+      # if the flower was worse its positive and they raise their threshold
+      
+      #check out https://www.sciencedirect.com/science/article/pii/S0896627319308402 for bayesian decision model
+      #TODO make a function for how threshold moves i.e. bayesian updating
+       
+       #step 1 extrapolate out using the information from this flower about what your threshold should be
+       # basically bees make a straightline between 0 signal 0 reward, and observed signal, observed reward
+       # then they figure out what the signal would have to be for them to get the reward they want
+         guessSignal <- prevBee$sugarPref*(prevFlow$signal/prevFlow$sugar) # so this is inverse slope of observed signal reward curve times what the bee wants
+         
+         
+         newBee$thresholdF1 <- mean(c(prevBee$thresholdF1,guessSignal))  # equal weight to what they know and new info
+       
+       newBee$pollenLoadF1 <- prevBee$pollenLoadF1 + prevFlow$pollenDepRate - .3 * prevBee$pollenLoadF1
+       newFlow$pollenF1 <- prevFlow$pollenF1     + .3 * prevBee$pollenLoadF1
+      
+       newFlow$visit <- 1
+      bee[currentTime,] <- newBee
+      flower[currentTime,] <- newFlow
+      
+     
+      return(list(bee=bee,flower=flower))      
+       
+  }
+  
+
+  
+# Initialize a bee
+  BeeInit <- function(thresholdPar = c(0,100),        # we are going to specify the min and max bees have a threshold for each flower species for now just one 
+                      microbesPar  = c(0,200),        # the microbial load for now just one species
+                      pollenLoadPar = 0,       # the pollen load for now just one species
+                      preferencesPar = c(30,.2)) # the initial floral preferences for sugar level and alkaloid
+              {
+            return( data.frame(
+                      time = 1,
+                      thresholdF1   = runif(1,thresholdPar[1],thresholdPar[2]),
+                      microbe1      = runif(1,microbesPar[1],microbesPar[2]),
+                      pollenLoadF1  = pollenLoadPar[1],
+                      sugarPref     = preferencesPar[1],
+                      alkaloidPref  = preferencesPar[2],
+                      visit         = 0,
+                      ID = paste(sample(size=10, x=letters),sep="",collapse="")))
+  }
+    BeeInit()          
+
+# Initialize a flower
+  FlowerInit <- function(species ="flower1",             # flower species is coded as a character string
+                         signalPar = c(0,100),              # this is a linear measure of a signal (TODO think of multiple signal axes?)       
+                         microbesP = c(0,0),            #mean and SD of microbes starting
+                         chemistryPar = c(30,5,.2,.01),  # mean and standard deviation for sugar then alkaloid
+                         pollenLoadPar = 0,       # starting pollen load
+                         pollenDepRate = 10,      # the amount of pollen deposited by a plant
+                         maxNectar = 100,
+                         refillRate = 2.5)             
+               {
+                  necVol <- runif(1,0,maxNectar)
+                  return( data.frame(
+                          time = 1,
+                          species = species,
+                          signal = runif(1,min = signalPar[1], max = signalPar[2]),
+                          microbesP1 = rnorm(1,microbesP[1],microbesP[2]),
+                          microbeK = 500 * necVol,
+                          necVol = necVol,
+                          maxNectar = maxNectar,
+                          refillRate=refillRate,
+                          sugar = rnorm(1,mean = chemistryPar[1], sd = chemistryPar[2]),
+                          alkaloid = rnorm(1, mean= chemistryPar[3],chemistryPar[4]),
+                          pollenF1 = pollenLoadPar[1],
+                          pollenDepRate = pollenDepRate,
+                          visit=0,
+                          ID = paste(sample(size=10, x=letters),sep="",collapse="")
+                    )
+              )
+  }
+  FlowerInit()
+#Initialize a microbe
+  MicrobeInit <- function(species = "microbe1",
+                          growthRate = 1.2,
+                          signalDelt = .002,
+                          sugarDelt = .002,
+                          alkaloidDelt = .001){
+                    return(data.frame (
+                      species = species,
+                      growthRate = growthRate,
+                      signalDelt = signalDelt,
+                      sugarDelt = sugarDelt,
+                      alkaloidDelt = alkaloidDelt
+                    ))
+  }
+
+
+  # time step 
+
+  daytimestep <- function(bee = NULL, flower=NULL, microbe=NULL){
+    # microbes grow 
+    
+   
+    flower1 <- grow(flower = flower, microbe = microbe)
+    
+    # bees forage
+    
+    if(is.null(bee) == F){
+    return(decide(bee = bee, flower = flower1))
+    }
+    
+    if(is.null(bee)==T){
+      return(flower1)
+    }
+    ###NOT FOR NOW 
+    # flowers get closer to death
+    # new flowers open
+  }
+  
+  
+  
+  
+  
+  nighttimestep <- function(bee, flower){
+    #microbes grow 
+    #flowers get closer to death
+    #new flowers open
+  }
+  
+  
+  ####end functions
+
+  
+#Test the functions ####
+
+  testFlower <- FlowerInit( signalPar = c(30.1,100))
+testBee <- BeeInit(microbesPar = c(0,200) , thresholdPar = c(0,30))
+  testMicrobe <- MicrobeInit(growthRate = 1.002)
+  
+  for (i in 1:100){
+  daytimestep(bee = testBee,flower = testFlower, microbe = testMicrobe) -> tmp
+  testBee <- tmp[["bee"]]
+  testFlower <- tmp[["flower"]]
+  }
+  
+  plot <- ggplot(testBee[1:10,], aes(x=time,y=thresholdF1))
+  plot+geom_point()
+  
+  plot <- ggplot(testBee, aes(x=time,y=pollenLoadF1))
+  plot+geom_point()
+  
+  plot <- ggplot(testFlower, aes(x=time,y=pollenF1))
+  plot+geom_point()
+  
+  plot <- ggplot(testFlower, aes(x=time,y=microbesP1))
+  plot+geom_line()
+  
+  plot <- ggplot(testFlower, aes(x=time,y=microbeK))
+  plot+geom_line()
+  
+  
+  # so for this to update we use the decide function and then assign the lists to each party
+  
+  #for example this would be a timestep...
+  
+  testFlower <- grow (microbe = testMicrobe, flower =testFlower)
+  list(bee=testBee, flower=testFlower) %>% {decide(bee=.$bee, flower=.$flower)} -> tmp
+  testBee <- tmp[["bee"]]
+  testFlower <- tmp[["flower"]]
+  
+  SugDparm <- seq(from=-.01, to =.01, length=25)
+  SigDparm <- seq(from=-.01, to=.01,  length =25)             
+  
+  Parms <- data.frame(expand.grid(SugDparm,SigDparm))
+  ParmsList <- split(Parms,seq(nrow(Parms)))
+
+  onerun <-   function(sigDel, sugDel){
+                
+              # make a community of pollinators none of which have microbes!
+                nPol    <- 5   #number of indiv per species
+                Pollinators <- list()
+                for(i in 1:nPol){
+                  Pollinators[[i]] <- BeeInit(thresholdPar = c(0,1),
+                                              microbesPar = c(0,200),
+                                              preferencesPar = c(10,100)
+                  )
+                }  
+              
+                # make a community of sterile flowers
+                nFlow     <- 40
+                Flowers <- list()
+                for(i in 1:nFlow){
+                  Flowers[[i]] <- FlowerInit(signalPar = c(0,100))
+                }
+                
+                # make a microbe with the parameters provided
+                ourMicrobe <- MicrobeInit(growthRate = 1.05,signalDelt = sigDel, sugarDelt = sugDel)
+                
+                for(i in 1:100){
+                  #first figure out which flowers bees will go to by randomly sampling as many flowers as there are bees
+                  encounters <- sample(1:length(Flowers), size = length(Pollinators), replace=F)
+                  encounterList <- vector("list",length(Flowers))
+                  encounterList[encounters] <- Pollinators
+                  
+                  test <- mapply(FUN=function(x,y){
+                    tmp <- daytimestep(flower=x,bee=y,microbe=ourMicrobe)
+                    },Flowers,encounterList,SIMPLIFY=F)
+                  
+                  Pollinators <- lapply(X = test[encounters], FUN = function(x){return(x$bee)})
+                  Flowers <- lapply(X=test, FUN = function(x){
+                    if(!is.null(x$flower)){return(x$flower)} 
+                      else(return(x))})
+                  
+                }  
+                
+                #calculate cumulative visits!
+                Flowers <- lapply(X=Flowers, FUN= function(x){x$cumulativeVisits<-cumsum(x$visit)
+                                                              x$signaldelt <- sigDel
+                                                              x$sugardelt <- sugDel
+                                                                    return(x)})
+                
+               Pollinators <- lapply(X=Pollinators, FUN= function(x){x$cumulativeVisits<-cumsum(x$visit)
+                x$signaldelt <- sigDel
+                x$sugardelt <- sugDel
+                return(x)})
+                
+                updatedFlowers<- do.call(rbind,Flowers)
+                updatedBees <- do.call(rbind,Pollinators)
+                return(list(flowers=updatedFlowers,bees=updatedBees))
+         }               
+   
+  
+  #try parallel processing
+  detectCores()
+  Sys.time()
+  test<- mclapply(X = ParmsList, 
+                  FUN = function(x){onerun(sigDel = x[1,1],sugDel = x[1,2])},
+                  mc.cores = 10)
+  Sys.time()
+  
+  flr<-test[[1]]$flowers
+  for(i in 2:length(test)){flr<-rbind(flr,test[[i]]$flowers)}
+  
+  bbz<-test[[1]]$bees
+  for(i in 2:length(test)){bbz<-rbind(bbz,test[[i]]$bees)}
+  dev.new()      
+  
+  flr$ID <- as.factor(flr$ID)
+  
+  timetofirstvisit <-flr[flr$cumulativeVisits==1,]
+  timetofirstvisit <- ddply(.data = timetofirstvisit, .variables = .(ID),  function(x){x[x$time==min(x$time),]})
+  signalbytimetovis <- ggplot(timetofirstvisit, aes(x=signaldelt,y=time)) 
+  signalbytimetovis + geom_point(alpha=.2,position=position_jitter(width=.00002))
+  sugarbytimetovis <- ggplot(timetofirstvisit, aes(x=sugardelt,y=time)) 
+  sugarbytimetovis + geom_point(alpha=.2,position=position_jitter(width=.00002))
+  
+  summary(timetofirstvisit)
+  
+  firstVisSig <- lm(data=timetofirstvisit, time~signaldelt*sugardelt)
+  summary(firstVisSig)
+  
+  summaryTtoV <- ddply(.data = timetofirstvisit, .variables = .(sugardelt,signaldelt), summarize, time=mean(time) )
+  ggplot(summaryTtoV, aes(x=signaldelt,y=time,color=(sugardelt),group=as.factor(sugardelt))) + geom_line()
+  
+  
+  
+  
+  names(Parms) <- c("signaldelt","sugardelt")
+  Parms$TtoFirst <- predict(firstVisSig,newdata = Parms,se.fit = T, type="response")$fit
+  Parms$TtoFirstSE <- predict(firstVisSig,newdata = Parms,se.fit = T,type="response")$se.fit
+  ggplot(Parms, aes(x=signaldelt,y=sugardelt,color=(TtoFirst),fill=TtoFirst)) +geom_tile()
+  
+  
+  
+  ggplot(Parms[Parms$sugardelt==-0.010,], aes(x=signaldelt,y=TtoFirst)) + geom_point() +
+    geom_errorbar(aes(ymin=TtoFirst-TtoFirstSE, ymax=TtoFirst+TtoFirstSE))
+  
+  ggplot(Parms[Parms$sugardelt==0.01|Parms$sugardelt==-0.010,], aes(color=as.factor(sugardelt),x=signaldelt,y=TtoFirst)) + geom_point() 
+  
+  maxvisits <- flr[flr$time==max(flr$time),]
+  
+  maxvisitsplot <- ggplot(maxvisits, aes(x=signaldelt,y=log(cumulativeVisits+1),color=signaldelt))
+  maxvisitsplot + geom_point(alpha=.2,position=position_jitter(width=.00002))
+  
+  summary(maxvisits)
+  table(maxvisits$cumulativeVisits)
+  signal <- glm(data=maxvisits, cumulativeVisits~signaldelt*sugardelt, family = poisson)
+  summary(signal)    
+  
+  Parms$Max <- predict(signal,newdata = Parms[,c("signaldelt","sugardelt")], type="response")
+  ggplot(Parms, aes(x=signaldelt,y=sugardelt,color=(Max),fill=Max)) +geom_tile()  
+  
